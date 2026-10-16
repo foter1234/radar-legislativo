@@ -37,7 +37,12 @@ export async function camaraAll(path, opts = {}) {
   let next = path + (path.includes('?') ? '&' : '?') + 'itens=100';
   let out = [];
   for (let guard = 0; next && guard < 200; guard++) {
-    const j = await getJSON('camara', next, opts);
+    let j;
+    try { j = await getJSON('camara', next, opts); } catch (e) {
+      // Alguns endpoints (ex.: /votacoes/{id}/votos) não são paginados e respondem 400 ao parâmetro `itens`.
+      if (guard === 0 && e instanceof HttpError && e.status === 400) { j = await getJSON('camara', path, opts); out = out.concat(j.dados || []); break; }
+      throw e;
+    }
     out = out.concat(j.dados || []);
     const n = (j.links || []).find((l) => l.rel === 'next');
     if (!n) { next = null; break; }
