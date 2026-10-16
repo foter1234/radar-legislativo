@@ -5,6 +5,7 @@ services:
     name: radar-legislativo
     runtime: node
     plan: free
+    region: virginia       # mesma região do Supabase (East US / North Virginia), para o servidor ficar perto do banco
     buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /healthz
