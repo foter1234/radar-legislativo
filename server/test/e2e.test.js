@@ -29,7 +29,7 @@ before(async () => {
   fs.writeFileSync(path.join(tmp, 'segredo.txt'), 'nao deve vazar');
   const { createApp } = await import('../app.js');
   const { runSync, syncState } = await import('../sync.js');
-  app = createApp({ dbPath: path.join(tmp, 'test.sqlite'), staticDir: path.join(tmp, 'dist'), autoSync: false });
+  app = await createApp({ db: process.env.TEST_DATABASE_URL || 'memory://', staticDir: path.join(tmp, 'dist'), autoSync: false });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${app.server.address().port}`;
   const r = await runSync(app.db, { from: d(-70) });
@@ -154,7 +154,7 @@ test('parlamentares: busca, filtros e perfil', async () => {
 test('CPF nunca aparece nas respostas nem no banco', async () => {
   const r = await get('/api/parlamentares/camara/1001');
   assert.ok(!JSON.stringify(r.body).includes(CPF));
-  const cache = app.db.all('SELECT body FROM http_cache');
+  const cache = await app.db.all('SELECT body FROM http_cache');
   assert.ok(cache.every((c) => !c.body.includes(CPF)));
 });
 
@@ -304,7 +304,7 @@ test('pauta ao vivo (Câmara e Senado) e cache', async () => {
 test('fonte oficial fora do ar: pauta usa cópia guardada', async () => {
   const ini = d(1), fim = d(2);
   const key = `pauta:camara:${ini}:${fim}`;
-  app.db.run('INSERT INTO http_cache (key, ts, body) VALUES (?, ?, ?)', key, Date.now() - 3600 * 1000, JSON.stringify([{ casa: 'camara', id: 'x', data: ini, hora: '10:00', cat: 'outros' }]));
+  await app.db.run('INSERT INTO http_cache (key, ts, body) VALUES (?, ?, ?)', key, Date.now() - 3600 * 1000, JSON.stringify([{ casa: 'camara', id: 'x', data: ini, hora: '10:00', cat: 'outros' }]));
   const saved = process.env.CAMARA_BASE;
   process.env.CAMARA_BASE = 'http://127.0.0.1:1/camara/api/v2'; // porta fechada
   try {
@@ -317,17 +317,17 @@ test('fonte oficial fora do ar: pauta usa cópia guardada', async () => {
 test('ressincronizar não duplica dados (idempotente) e é retomável', async () => {
   const { runSync } = await import('../sync.js');
   const antes = {
-    v: app.db.get('SELECT COUNT(*) n FROM voto').n,
-    s: app.db.get('SELECT COUNT(*) n FROM presenca').n,
-    vt: app.db.get('SELECT COUNT(*) n FROM votacao').n,
+    v: (await app.db.get('SELECT COUNT(*) n FROM voto')).n,
+    s: (await app.db.get('SELECT COUNT(*) n FROM presenca')).n,
+    vt: (await app.db.get('SELECT COUNT(*) n FROM votacao')).n,
   };
   const det = (id) => mock.hits.byPath.get(`/camara/api/v2/votacoes/${id}`) || 0;
   const antigas = [det('9001-1'), det('9002-1'), det('9003-1')];
   const recente = det('9004-1');
   await runSync(app.db, { from: d(-70) });
-  assert.equal(app.db.get('SELECT COUNT(*) n FROM voto').n, antes.v);
-  assert.equal(app.db.get('SELECT COUNT(*) n FROM presenca').n, antes.s);
-  assert.equal(app.db.get('SELECT COUNT(*) n FROM votacao').n, antes.vt);
+  assert.equal((await app.db.get('SELECT COUNT(*) n FROM voto')).n, antes.v);
+  assert.equal((await app.db.get('SELECT COUNT(*) n FROM presenca')).n, antes.s);
+  assert.equal((await app.db.get('SELECT COUNT(*) n FROM votacao')).n, antes.vt);
   // só a votação recente (últimos 3 dias) é baixada de novo; as antigas não
   assert.deepEqual([det('9001-1'), det('9002-1'), det('9003-1')], antigas);
   assert.equal(det('9004-1'), recente + 1);
@@ -369,4 +369,34 @@ test('compressão gzip em respostas grandes', async () => {
   assert.equal(r.headers.get('content-encoding'), 'gzip');
   const j = await r.json();
   assert.ok(j.votos.length > 100);
+});
+
+test('trava: só uma importação por vez, mesmo entre processos', async () => {
+  const { runSync } = await import('../sync.js');
+  // simula outra máquina (ex.: GitHub Actions) com a trava ativa
+  await app.db.setMeta('sync_lock', JSON.stringify({ owner: 'outro-processo', until: Date.now() + 60000 }));
+  const r = await runSync(app.db, { from: d(-5) });
+  assert.equal(r.skipped, true);
+  // trava vencida é ignorada
+  await app.db.setMeta('sync_lock', JSON.stringify({ owner: 'outro-processo', until: Date.now() - 1 }));
+  const r2 = await runSync(app.db, { from: d(-5) });
+  assert.notEqual(r2.skipped, true);
+  assert.equal(await app.db.getMeta('sync_lock'), null);
+});
+
+test('progresso da importação fica salvo no banco e aparece no status', async () => {
+  const st = JSON.parse(await app.db.getMeta('sync_state'));
+  assert.equal(st.running, false);
+  assert.match(st.fase, /concluído/);
+  const { body } = await get('/api/status');
+  assert.equal(body.sync.running, false);
+  assert.ok(body.banco && typeof body.banco.tipo === 'string');
+});
+
+test('limite de tempo pausa a importação sem erro', async () => {
+  const { runSync, syncState } = await import('../sync.js');
+  await app.db.run("DELETE FROM meta WHERE key LIKE 'done:%'");
+  const r = await runSync(app.db, { from: d(-70), maxMinutes: 0.00001 });
+  assert.equal(r.interrompido, true);
+  assert.match(syncState.fase, /pausado/);
 });

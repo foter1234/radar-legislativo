@@ -30,7 +30,13 @@ export default function Sobre() {
               </tbody>
             </table>
           </div>
-          <p className="small muted">Última sincronização concluída: {fmtDateTime(s.ultimaSync)}{s.desde ? ` · histórico desde ${fmtDate(s.desde)}` : ''}.</p>
+          <p className="small muted">Última sincronização concluída: {fmtDateTime(s.ultimaSync)}{s.desde ? ` · histórico desde ${fmtDate(s.desde)}` : ''}{s.sync.onde ? ` · importação feita por: ${s.sync.onde}` : ''}.</p>
+          {s.banco && s.banco.tamanhoMB !== null && (
+            <div className="stack" style={{ gap: 6 }}>
+              <span className="small muted">Banco de dados ({s.banco.tipo}): {s.banco.tamanhoMB.toLocaleString('pt-BR')} MB{s.banco.limiteMB ? ` de ${s.banco.limiteMB} MB do plano` : ''}</span>
+              {s.banco.limiteMB ? <div className="meter" aria-hidden="true"><i style={{ width: `${Math.min(100, (100 * s.banco.tamanhoMB) / s.banco.limiteMB)}%`, background: s.banco.tamanhoMB / s.banco.limiteMB > 0.85 ? 'var(--nao)' : undefined }} /></div> : null}
+            </div>
+          )}
         </section>
       )}
 

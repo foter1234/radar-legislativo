@@ -1,0 +1,22 @@
+# Blueprint do Render (plano gratuito). No Render: New → Blueprint → escolha este repositório.
+# O banco fica no Supabase (DATABASE_URL); a importação roda no GitHub Actions.
+services:
+  - type: web
+    name: radar-legislativo
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      - key: DATABASE_URL
+        sync: false          # o Render pede o valor na criação: cole a conexão "Session pooler" do Supabase
+      - key: SYNC_ON_START
+        value: "0"           # não importar dentro do Render (o plano grátis dorme e apaga o disco)
+      - key: TRUST_PROXY
+        value: "1"
+      - key: DB_LIMIT_MB
+        value: "500"         # limite do plano grátis do Supabase, para o aviso na página "Sobre os dados"

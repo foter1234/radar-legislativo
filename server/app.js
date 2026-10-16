@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
-import { openDb } from './db.js';
+import { openDb, defaultDbTarget } from './db.js';
 import { createApi } from './api.js';
-import { runSync, defaultDbPath } from './sync.js';
+import { runSync } from './sync.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MIME = {
@@ -21,8 +21,17 @@ const SECURITY = {
   'Content-Security-Policy': "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'",
 };
 
-export function createApp({ dbPath = defaultDbPath(), staticDir = path.join(ROOT, 'web', 'dist'), autoSync = true, rateLimit = Number(process.env.RATE_LIMIT) || 300 } = {}) {
-  const db = openDb(dbPath);
+/**
+ * Monta o servidor. `db`: alvo do banco (URL do Postgres, pasta do PGlite ou 'memory://').
+ * autoSync: importar o histórico dentro do servidor. Padrão: sim no modo local; não quando há DATABASE_URL
+ * (no modo hospedado grátis quem importa é o GitHub Actions). SYNC_ON_START=1/0 força.
+ */
+export async function createApp({
+  db: target = defaultDbTarget(), staticDir = path.join(ROOT, 'web', 'dist'),
+  autoSync = process.env.SYNC_ON_START ? process.env.SYNC_ON_START !== '0' : !process.env.DATABASE_URL,
+  rateLimit = Number(process.env.RATE_LIMIT) || 300,
+} = {}) {
+  const db = await openDb(target);
   const api = createApi(db);
   const gzCache = new Map();
   const hits = new Map();
@@ -69,7 +78,7 @@ export function createApp({ dbPath = defaultDbPath(), staticDir = path.join(ROOT
     const immutable = /\/assets\//.test(file.replace(/\\/g, '/'));
     const cacheKey = `${file}:${stat.mtimeMs}`;
     let body = fs.readFileSync(file);
-    const headers = { 'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache' };
+    const headers = { 'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache', 'X-App': 'radar-legislativo' };
     if (file.endsWith('sw.js')) headers['Service-Worker-Allowed'] = '/';
     if (COMPRESSIBLE.has(ext) && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
       let gz = gzCache.get(cacheKey);
@@ -87,12 +96,13 @@ export function createApp({ dbPath = defaultDbPath(), staticDir = path.join(ROOT
     try {
       if (req.method !== 'GET' && req.method !== 'HEAD') return send(req, res, 405, 'text/plain; charset=utf-8', 'Método não permitido');
       const url = new URL(req.url, 'http://localhost');
-      if (url.pathname === '/healthz') return send(req, res, 200, 'text/plain; charset=utf-8', 'ok');
+      if (url.pathname === '/healthz') return send(req, res, 200, 'text/plain; charset=utf-8', 'ok', { 'Cache-Control': 'no-store' });
       if (url.pathname.startsWith('/api/')) {
         if (limited(req)) return send(req, res, 429, 'application/json; charset=utf-8', JSON.stringify({ erro: 'Muitas consultas em pouco tempo. Aguarde um instante.' }), { 'Retry-After': '30' });
         const r = await api(url.pathname, url.searchParams);
         if (!r) return send(req, res, 404, 'application/json; charset=utf-8', JSON.stringify({ erro: 'Rota não encontrada' }));
-        const live = url.pathname.startsWith('/api/pauta') || url.pathname === '/api/status';
+        // respostas que ainda vão mudar em instantes (situação de projetos sendo conferida) não podem ficar no cache do navegador
+        const live = url.pathname.startsWith('/api/pauta') || url.pathname === '/api/status' || !!(r.body && r.body.resumo && r.body.resumo.pendentes > 0);
         return send(req, res, r.status, 'application/json; charset=utf-8', JSON.stringify(r.body), { 'Cache-Control': live || r.status !== 200 ? 'no-store' : 'private, max-age=60' }, true);
       }
       return serveStatic(req, res, url.pathname);
@@ -104,7 +114,7 @@ export function createApp({ dbPath = defaultDbPath(), staticDir = path.join(ROOT
   });
 
   let timer = null;
-  const tick = () => runSync(db).catch((e) => console.error('[sync] falhou:', e));
+  const tick = () => runSync(db, { onde: 'servidor' }).catch((e) => console.error('[sync] falhou:', e));
   if (autoSync) {
     const hours = Number(process.env.SYNC_INTERVAL_HOURS) || 6;
     setTimeout(tick, 1500).unref();
@@ -112,5 +122,8 @@ export function createApp({ dbPath = defaultDbPath(), staticDir = path.join(ROOT
     timer.unref();
   }
 
-  return { server, db, close: () => new Promise((r) => { if (timer) clearInterval(timer); server.close(() => { db.close(); r(); }); }) };
+  return {
+    server, db,
+    close: () => new Promise((r) => { if (timer) clearInterval(timer); server.close(() => { Promise.resolve(db.close()).catch(() => {}).finally(r); }); }),
+  };
 }

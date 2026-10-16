@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import { Icon, Mark } from './ui';
+import { onWaking } from '../api';
 
 const MAIN = [
   { to: '/', label: 'Início', icon: Icon.home, end: true },
@@ -30,6 +31,8 @@ function useTheme() {
 export default function Layout() {
   const [theme, setTheme] = useTheme();
   const [more, setMore] = useState(false);
+  const [waking, setWakingUi] = useState(false);
+  useEffect(() => onWaking(setWakingUi), []);
   const loc = useLocation();
   useEffect(() => { setMore(false); window.scrollTo(0, 0); }, [loc.pathname]);
   const moreActive = MORE.some((m) => loc.pathname.startsWith(m.to));
@@ -53,6 +56,12 @@ export default function Layout() {
         </div>
       </header>
 
+      {waking && (
+        <div className="wakebar" role="status">
+          <span className="spin" aria-hidden="true" />
+          Acordando o servidor… a versão gratuita “dorme” quando fica sem uso e leva até 1 minuto para voltar.
+        </div>
+      )}
       <main id="conteudo" className="page"><Outlet /></main>
 
       <footer className="footer">

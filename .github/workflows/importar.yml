@@ -1,0 +1,81 @@
+# Importa o histórico das APIs oficiais (Câmara e Senado) para o banco (Supabase).
+# Roda sozinho a cada 6 horas e também pode ser disparado à mão em Actions → "Importar dados oficiais" → Run workflow.
+# Requer o segredo DATABASE_URL (Settings → Secrets and variables → Actions).
+name: Importar dados oficiais
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # minuto "quebrado" para fugir do horário de pico do GitHub
+  workflow_dispatch:
+    inputs:
+      from:
+        description: 'Data inicial (AAAA-MM-DD). Vazio = desde o início configurado (SYNC_FROM ou 2023-02-01)'
+        required: false
+      to:
+        description: 'Data final (AAAA-MM-DD). Vazio = hoje'
+        required: false
+      casa:
+        description: 'Casa'
+        type: choice
+        options: [ambas, camara, senado]
+        default: ambas
+      only:
+        description: 'O que importar'
+        default: 'votos,presenca,parlamentares'
+
+# nunca duas importações ao mesmo tempo (a carga inicial pode passar de uma rodada)
+concurrency:
+  group: importar-dados
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # só para o commit vazio que mantém o agendamento ativo
+
+jobs:
+  importar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev
+      - name: Importar
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SYNC_FROM: ${{ vars.SYNC_FROM }}
+          IN_FROM: ${{ inputs.from }}
+          IN_TO: ${{ inputs.to }}
+          IN_CASA: ${{ inputs.casa }}
+          IN_ONLY: ${{ inputs.only }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::Falta o segredo DATABASE_URL (Settings → Secrets and variables → Actions). Use a conexão 'Session pooler' do Supabase."
+            exit 1
+          fi
+          ARGS="--max-minutes 330"
+          [ -n "$IN_FROM" ] && ARGS="$ARGS --from $IN_FROM"
+          [ -n "$IN_TO" ] && ARGS="$ARGS --to $IN_TO"
+          [ -n "$IN_CASA" ] && [ "$IN_CASA" != "ambas" ] && ARGS="$ARGS --casa $IN_CASA"
+          [ -n "$IN_ONLY" ] && ARGS="$ARGS --only $IN_ONLY"
+          node server/sync.js $ARGS
+
+  # O GitHub desliga agendamentos de repositórios públicos após 60 dias sem atividade.
+  # Se o último commit tiver mais de 45 dias, faz um commit vazio para manter tudo rodando.
+  manter-ativo:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          last=$(git log -1 --format=%ct)
+          age=$(( ( $(date +%s) - last ) / 86400 ))
+          echo "Último commit há $age dias."
+          if [ "$age" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Manter agendamento da importação ativo"
+            git push
+          fi

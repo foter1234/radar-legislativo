@@ -16,15 +16,15 @@ export function createStatusService(db) {
       const j = await getJSON('camara', `/proposicoes/${id}`, { retries: 2 });
       const st = (j.dados && j.dados.statusProposicao) || {};
       const lei = isLeiSituacao(st.codSituacao, st.descricaoSituacao) ? 1 : 0;
-      db.run(`INSERT INTO proposicao_status (id, situacao, cod_situacao, tramitacao, orgao, despacho, data_status, is_lei, atualizado)
+      await db.run(`INSERT INTO proposicao_status (id, situacao, cod_situacao, tramitacao, orgao, despacho, data_status, is_lei, atualizado)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET situacao = excluded.situacao, cod_situacao = excluded.cod_situacao, tramitacao = excluded.tramitacao,
+              ON CONFLICT (id) DO UPDATE SET situacao = excluded.situacao, cod_situacao = excluded.cod_situacao, tramitacao = excluded.tramitacao,
                 orgao = excluded.orgao, despacho = excluded.despacho, data_status = excluded.data_status, is_lei = excluded.is_lei, atualizado = excluded.atualizado`,
       id, st.descricaoSituacao || null, st.codSituacao != null ? String(st.codSituacao) : null, st.descricaoTramitacao || null, st.siglaOrgao || null,
       st.despacho || null, st.dataHora || null, lei, Date.now());
     } catch (e) {
       // marca a tentativa para não insistir a cada consulta; tenta de novo depois de algumas horas
-      db.run(`INSERT INTO proposicao_status (id, is_lei, atualizado) VALUES (?, 0, ?)
+      await db.run(`INSERT INTO proposicao_status (id, is_lei, atualizado) VALUES (?, 0, ?)
               ON CONFLICT(id) DO UPDATE SET atualizado = excluded.atualizado`, id, Date.now() - STALE_MS + 3 * 3600 * 1000);
     }
   }
@@ -32,15 +32,17 @@ export function createStatusService(db) {
     while (running < CONC && queue.length) {
       const id = queue.shift();
       running++;
-      fetchStatus(id).finally(() => { running--; inflight.delete(id); pump(); });
+      fetchStatus(id).catch(() => {}).finally(() => { running--; inflight.delete(id); pump(); });
     }
   }
   return {
     /** Enfileira as proposições sem situação recente. Retorna quantas ainda estão pendentes. */
-    ensure(ids) {
+    async ensure(ids) {
       let pend = 0;
+      const rows = ids.length ? await db.all('SELECT id, is_lei, atualizado FROM proposicao_status WHERE id = ANY(?)', ids) : [];
+      const known = new Map(rows.map((r) => [Number(r.id), r]));
       for (const id of ids) {
-        const r = db.get('SELECT is_lei, atualizado FROM proposicao_status WHERE id = ?', id);
+        const r = known.get(Number(id));
         const ttl = r && r.is_lei ? STALE_LEI_MS : STALE_MS;
         const fresh = r && Date.now() - r.atualizado < ttl;
         if (fresh) continue;

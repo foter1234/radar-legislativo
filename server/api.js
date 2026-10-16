@@ -17,6 +17,8 @@ const dateParam = (v) => (isIsoDate(v) ? v : null);
 const casaParam = (v) => (v === 'camara' || v === 'senado' ? v : '');
 const escLike = (s) => s.replace(/[\\%_]/g, (m) => `\\${m}`);
 const decode = (s) => { try { return decodeURIComponent(s); } catch { throw new ApiError(400, 'Parâmetro inválido'); } };
+/** Conta as linhas que atendem à condição (equivale ao SUM(condição) do SQLite). */
+const cnt = (cond) => `COUNT(*) FILTER (WHERE ${cond})`;
 const words = (q) => norm(q).split(/\s+/).filter(Boolean).slice(0, 6);
 
 export function createApi(db) {
@@ -25,13 +27,14 @@ export function createApi(db) {
 
   /** Cache em disco com tolerância a falhas: se a fonte oficial cair, entrega a última cópia. */
   async function cached(key, ttl, loader) {
-    const row = db.get('SELECT ts, body FROM http_cache WHERE key = ?', key);
+    const row = await db.get('SELECT ts, body FROM http_cache WHERE key = ?', key).catch(() => null);
     if (row && Date.now() - row.ts < ttl) return JSON.parse(row.body);
     if (loading.has(key)) return loading.get(key);
     const p = (async () => {
       try {
         const v = await loader();
-        db.run('INSERT INTO http_cache (key, ts, body) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET ts = excluded.ts, body = excluded.body', key, Date.now(), JSON.stringify(v));
+        await db.run('INSERT INTO http_cache (key, ts, body) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET ts = excluded.ts, body = excluded.body', key, Date.now(), JSON.stringify(v))
+          .catch((e) => console.error('[cache] não gravou:', e.message));
         return v;
       } catch (e) {
         if (row) return JSON.parse(row.body);
@@ -42,21 +45,31 @@ export function createApi(db) {
     return p;
   }
 
-  const coverage = (casa) => db.get('SELECT MIN(data) ini, MAX(data) fim FROM votacao WHERE casa = ?', casa) || {};
+  const coverage = async (casa) => (await db.get('SELECT MIN(data) ini, MAX(data) fim FROM votacao WHERE casa = ?', casa)) || {};
 
   /* ---------- status ---------- */
-  function status() {
-    const per = (casa) => {
-      const v = db.get('SELECT COUNT(*) n, SUM(n_total > 0) nominais, MIN(data) ini, MAX(data) fim FROM votacao WHERE casa = ?', casa);
-      return {
-        votacoes: num(v.n), nominais: num(v.nominais), primeira: v.ini, ultima: v.fim,
-        parlamentares: num(db.get('SELECT COUNT(*) n FROM parlamentar WHERE casa = ?', casa).n),
-        sessoes: num(db.get('SELECT COUNT(*) n FROM sessao WHERE casa = ?', casa).n),
-      };
+  async function status() {
+    const per = async (casa) => {
+      const v = await db.get(`SELECT COUNT(*) n, ${cnt('n_total > 0')} nominais, MIN(data) ini, MAX(data) fim,
+        (SELECT COUNT(*) FROM parlamentar WHERE casa = ?) parl, (SELECT COUNT(*) FROM sessao WHERE casa = ?) sess FROM votacao WHERE casa = ?`, casa, casa, casa);
+      return { votacoes: num(v.n), nominais: num(v.nominais), primeira: v.ini, ultima: v.fim, parlamentares: num(v.parl), sessoes: num(v.sess) };
     };
+    const [camara, senado, ultimaSync, desde, salvo, tamanho] = await Promise.all([
+      per('camara'), per('senado'), db.getMeta('last_sync'), db.getMeta('sync_from'), db.getMeta('sync_state'), db.size(),
+    ]);
+    // a importação pode estar rodando em outro lugar (GitHub Actions): o progresso fica salvo no banco
+    let sync = { ...syncState };
+    if (!syncState.running && salvo) {
+      try {
+        const st = JSON.parse(salvo);
+        // sem notícias há mais de 20 minutos = processo morreu
+        if (st.running && Date.now() - (st.salvoEm || 0) > 20 * 60000) { st.running = false; st.fase = 'interrompida (sem notícias); retoma na próxima rodada'; }
+        if (st.running || !syncState.inicio || (st.inicio || '') > (syncState.inicio || '')) sync = st;
+      } catch { /* ignora */ }
+    }
     return {
-      camara: per('camara'), senado: per('senado'), ultimaSync: db.getMeta('last_sync'), desde: db.getMeta('sync_from'),
-      sync: { ...syncState },
+      camara, senado, ultimaSync, desde, sync,
+      banco: { tipo: db.kind === 'pg' ? 'Postgres' : 'Postgres embutido', tamanhoMB: tamanho ? Math.round(tamanho / 104857.6) / 10 : null, limiteMB: process.env.DB_LIMIT_MB ? Number(process.env.DB_LIMIT_MB) : null },
     };
   }
 
@@ -83,32 +96,32 @@ export function createApi(db) {
     placar: { sim: num(r.n_sim), nao: num(r.n_nao), abst: num(r.n_abst), obst: num(r.n_obst), aus: num(r.n_aus), outro: num(r.n_outro), total: num(r.n_total) },
   });
 
-  function listVotacoes(ctx) {
+  async function listVotacoes(ctx) {
     const { where, params } = votacaoFilters(ctx.q);
     const w = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const limit = clamp(ctx.q.get('limit'), 30, 1, 100), offset = clamp(ctx.q.get('offset'), 0, 0, 1e7);
-    const total = num(db.get(`SELECT COUNT(*) n FROM votacao ${w}`, ...params).n);
-    const itens = db.all(
+    const total = num((await db.get(`SELECT COUNT(*) n FROM votacao ${w}`, ...params)).n);
+    const itens = (await db.all(
       `SELECT casa, id, data, orgao, titulo, descricao, ementa, aprovada, secreta, n_sim, n_nao, n_abst, n_obst, n_aus, n_outro, n_total
-       FROM votacao ${w} ORDER BY data DESC, ts DESC LIMIT ? OFFSET ?`, ...params, limit, offset).map(votacaoRow);
-    return { total, itens, cobertura: { camara: coverage('camara'), senado: coverage('senado') } };
+       FROM votacao ${w} ORDER BY data DESC, ts DESC LIMIT ? OFFSET ?`, ...params, limit, offset)).map(votacaoRow);
+    return { total, itens, cobertura: { camara: await coverage('camara'), senado: await coverage('senado') } };
   }
 
-  function getVotacao(ctx, casa, rawId) {
+  async function getVotacao(ctx, casa, rawId) {
     const id = decode(rawId);
-    const v = db.get('SELECT * FROM votacao WHERE casa = ? AND id = ?', casa, id);
+    const v = await db.get('SELECT * FROM votacao WHERE casa = ? AND id = ?', casa, id);
     if (!v) throw new ApiError(404, 'Votação não encontrada');
-    const votos = db.all(
+    const votos = (await db.all(
       `SELECT x.parlamentar_id id, COALESCE(p.nome, '—') nome, x.partido, x.uf, x.cat, x.raw, x.alinhado, x.ref_tipo, p.foto
        FROM voto x LEFT JOIN parlamentar p ON p.casa = x.casa AND p.id = x.parlamentar_id
-       WHERE x.casa = ? AND x.votacao_id = ? ORDER BY COALESCE(p.nome_norm, '')`, casa, id)
+       WHERE x.casa = ? AND x.votacao_id = ? ORDER BY COALESCE(p.nome_norm, '')`, casa, id))
       .map((x) => ({ ...x, alinhado: x.alinhado == null ? null : !!x.alinhado }));
-    const orientacoes = db.all('SELECT nome, cat, raw FROM orientacao WHERE casa = ? AND votacao_id = ? ORDER BY nome', casa, id);
+    const orientacoes = await db.all('SELECT nome, cat, raw FROM orientacao WHERE casa = ? AND votacao_id = ? ORDER BY nome', casa, id);
     const omap = new Map(orientacoes.map((o) => [o.nome.toUpperCase(), o.cat]));
-    const partidos = db.all(
-      `SELECT partido, COUNT(*) total, SUM(cat = 'sim') sim, SUM(cat = 'nao') nao, SUM(cat = 'abst') abst, SUM(cat = 'obst') obst, SUM(cat = 'aus') aus,
-              SUM(cat = 'outro') outro, SUM(alinhado = 1) seguiu, SUM(alinhado = 0) desvio, MAX(ref_tipo) ref_tipo
-       FROM voto WHERE casa = ? AND votacao_id = ? GROUP BY partido ORDER BY total DESC, partido`, casa, id)
+    const partidos = (await db.all(
+      `SELECT partido, COUNT(*) total, ${cnt("cat = 'sim'")} sim, ${cnt("cat = 'nao'")} nao, ${cnt("cat = 'abst'")} abst, ${cnt("cat = 'obst'")} obst, ${cnt("cat = 'aus'")} aus,
+              ${cnt("cat = 'outro'")} outro, ${cnt('alinhado = 1')} seguiu, ${cnt('alinhado = 0')} desvio, MAX(ref_tipo) ref_tipo
+       FROM voto WHERE casa = ? AND votacao_id = ? GROUP BY partido ORDER BY total DESC, partido`, casa, id))
       .map((p) => ({
         partido: p.partido, total: num(p.total), sim: num(p.sim), nao: num(p.nao), abst: num(p.abst), obst: num(p.obst), aus: num(p.aus), outro: num(p.outro),
         seguiu: pct(num(p.seguiu), num(p.seguiu) + num(p.desvio)), refTipo: p.ref_tipo, orientacao: omap.get(String(p.partido).toUpperCase()) || null,
@@ -124,7 +137,7 @@ export function createApi(db) {
     primeira: p.primeira_data, ultima: p.ultima_data, legislatura: p.legislatura,
   });
 
-  function listParlamentares(ctx) {
+  async function listParlamentares(ctx) {
     const q = ctx.q;
     const where = [], params = [];
     const casa = casaParam(q.get('casa'));
@@ -134,51 +147,53 @@ export function createApi(db) {
     for (const w of words(q.get('q') || '')) { where.push("nome_norm LIKE ? ESCAPE '\\'"); params.push(`%${escLike(w)}%`); }
     const w = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const limit = clamp(q.get('limit'), 48, 1, 100), offset = clamp(q.get('offset'), 0, 0, 1e7);
-    const total = num(db.get(`SELECT COUNT(*) n FROM parlamentar ${w}`, ...params).n);
-    const itens = db.all(`SELECT * FROM parlamentar ${w} ORDER BY nome_norm LIMIT ? OFFSET ?`, ...params, limit, offset).map(parlamentarRow);
+    const total = num((await db.get(`SELECT COUNT(*) n FROM parlamentar ${w}`, ...params)).n);
+    const itens = (await db.all(`SELECT * FROM parlamentar ${w} ORDER BY nome_norm LIMIT ? OFFSET ?`, ...params, limit, offset)).map(parlamentarRow);
     return { total, itens };
   }
 
-  function filtrosParlamentares(ctx) {
+  async function filtrosParlamentares(ctx) {
     const casa = casaParam(ctx.q.get('casa')) || 'camara';
     return {
-      partidos: db.all('SELECT DISTINCT partido FROM parlamentar WHERE casa = ? AND partido IS NOT NULL ORDER BY partido', casa).map((r) => r.partido),
-      ufs: db.all('SELECT DISTINCT uf FROM parlamentar WHERE casa = ? AND uf IS NOT NULL AND uf <> \'\' ORDER BY uf', casa).map((r) => r.uf),
+      partidos: (await db.all('SELECT DISTINCT partido FROM parlamentar WHERE casa = ? AND partido IS NOT NULL ORDER BY partido', casa)).map((r) => r.partido),
+      ufs: (await db.all("SELECT DISTINCT uf FROM parlamentar WHERE casa = ? AND uf IS NOT NULL AND uf <> '' ORDER BY uf", casa)).map((r) => r.uf),
     };
   }
 
-  function requireParlamentar(casa, id) {
-    const p = db.get('SELECT * FROM parlamentar WHERE casa = ? AND id = ?', casa, Number(id));
+  async function requireParlamentar(casa, id) {
+    const n = Number(id);
+    if (!Number.isSafeInteger(n) || n > 2147483647) throw new ApiError(404, 'Parlamentar não encontrado');
+    const p = await db.get('SELECT * FROM parlamentar WHERE casa = ? AND id = ?', casa, n);
     if (!p) throw new ApiError(404, 'Parlamentar não encontrado');
     return p;
   }
 
   /** Janela em que o parlamentar aparece nos dados (primeira e última votação ou sessão), recortada pelo período pedido. */
-  function janela(casa, id, de, ate) {
-    const w = db.get(
+  async function janela(casa, id, de, ate) {
+    const w = await db.get(
       `SELECT MIN(d) ini, MAX(d) fim FROM (
          SELECT v.data d FROM voto x JOIN votacao v ON v.casa = x.casa AND v.id = x.votacao_id WHERE x.casa = ? AND x.parlamentar_id = ?
          UNION ALL
-         SELECT s.data FROM presenca p JOIN sessao s ON s.casa = p.casa AND s.id = p.sessao_id WHERE p.casa = ? AND p.parlamentar_id = ?)`,
+         SELECT s.data FROM presenca p JOIN sessao s ON s.casa = p.casa AND s.id = p.sessao_id WHERE p.casa = ? AND p.parlamentar_id = ?) AS j`,
       casa, id, casa, id);
     if (!w || !w.ini) return null;
     return { ini: de && de > w.ini ? de : w.ini, fim: ate && ate < w.fim ? ate : w.fim, primeira: w.ini, ultima: w.fim };
   }
 
-  function stats(casa, id, de, ate) {
-    const j = janela(casa, id, de, ate);
+  async function stats(casa, id, de, ate) {
+    const j = await janela(casa, id, de, ate);
     if (!j || j.ini > j.fim) return { janela: j, votos: null, nominais: 0, participacao: null, alinhamento: null, orientacao: null, presenca: null };
-    const v = db.get(
-      `SELECT COUNT(*) total, SUM(x.cat = 'sim') sim, SUM(x.cat = 'nao') nao, SUM(x.cat = 'abst') abst, SUM(x.cat = 'obst') obst, SUM(x.cat = 'aus') aus,
-              SUM(x.cat = 'outro') outro, SUM(x.alinhado = 1) alinhados, SUM(x.alinhado IS NOT NULL) com_ref,
-              SUM(x.ref_tipo = 'orientacao' AND x.alinhado = 1) seg_ori, SUM(x.ref_tipo = 'orientacao') com_ori, SUM(x.raw = 'NCom') ncom
+    const v = await db.get(
+      `SELECT COUNT(*) total, ${cnt("x.cat = 'sim'")} sim, ${cnt("x.cat = 'nao'")} nao, ${cnt("x.cat = 'abst'")} abst, ${cnt("x.cat = 'obst'")} obst, ${cnt("x.cat = 'aus'")} aus,
+              ${cnt("x.cat = 'outro'")} outro, ${cnt('x.alinhado = 1')} alinhados, ${cnt('x.alinhado IS NOT NULL')} com_ref,
+              ${cnt("x.ref_tipo = 'orientacao' AND x.alinhado = 1")} seg_ori, ${cnt("x.ref_tipo = 'orientacao'")} com_ori, ${cnt("x.raw = 'NCom'")} ncom
        FROM voto x JOIN votacao v ON v.casa = x.casa AND v.id = x.votacao_id
        WHERE x.casa = ? AND x.parlamentar_id = ? AND v.data BETWEEN ? AND ?`, casa, id, j.ini, j.fim);
-    const nominais = num(db.get('SELECT COUNT(*) n FROM votacao WHERE casa = ? AND n_total > 0 AND data BETWEEN ? AND ?', casa, j.ini, j.fim).n);
+    const nominais = num((await db.get('SELECT COUNT(*) n FROM votacao WHERE casa = ? AND n_total > 0 AND data BETWEEN ? AND ?', casa, j.ini, j.fim)).n);
     const votou = num(v.sim) + num(v.nao) + num(v.abst) + num(v.obst);
     let presenca;
     if (casa === 'camara') {
-      const s = db.get(
+      const s = await db.get(
         `SELECT COUNT(*) total, (SELECT COUNT(*) FROM presenca p JOIN sessao s2 ON s2.casa = p.casa AND s2.id = p.sessao_id
                                  WHERE p.casa = ? AND p.parlamentar_id = ? AND s2.data BETWEEN ? AND ?) presentes
          FROM sessao WHERE casa = ? AND complete = 1 AND data BETWEEN ? AND ?`, casa, id, j.ini, j.fim, casa, j.ini, j.fim);
@@ -215,17 +230,14 @@ export function createApi(db) {
   }
 
   async function getParlamentar(ctx, casa, id) {
-    const p = requireParlamentar(casa, id);
+    const p = await requireParlamentar(casa, id);
     const de = dateParam(ctx.q.get('de')), ate = dateParam(ctx.q.get('ate'));
-    return {
-      parlamentar: parlamentarRow(p),
-      detalhe: casa === 'camara' ? await detalheDeputado(p.id) : null,
-      stats: stats(casa, p.id, de, ate),
-    };
+    const [detalhe, st] = await Promise.all([casa === 'camara' ? detalheDeputado(p.id) : null, stats(casa, p.id, de, ate)]);
+    return { parlamentar: parlamentarRow(p), detalhe, stats: st };
   }
 
-  function votosParlamentar(ctx, casa, id) {
-    const p = requireParlamentar(casa, id);
+  async function votosParlamentar(ctx, casa, id) {
+    const p = await requireParlamentar(casa, id);
     const q = ctx.q;
     const de = dateParam(q.get('de')), ate = dateParam(q.get('ate'));
     const limit = clamp(q.get('limit'), 30, 1, 100), offset = clamp(q.get('offset'), 0, 0, 1e7);
@@ -239,7 +251,7 @@ export function createApi(db) {
     if (resultado === 'no') extra.push('v.aprovada = 0');
     let from, where, params;
     if (ausencias) {
-      const j = janela(casa, p.id, de, ate);
+      const j = await janela(casa, p.id, de, ate);
       if (!j || j.ini > j.fim) return { total: 0, itens: [] };
       from = 'votacao v LEFT JOIN voto x ON x.casa = v.casa AND x.votacao_id = v.id AND x.parlamentar_id = ?';
       where = ['v.casa = ?', 'v.n_total > 0', 'v.data BETWEEN ? AND ?'];
@@ -255,40 +267,40 @@ export function createApi(db) {
     }
     where.push(...extra); params.push(...extraParams);
     const w = where.join(' AND ');
-    const total = num(db.get(`SELECT COUNT(*) n FROM ${from} WHERE ${w}`, ...params).n);
-    const itens = db.all(
+    const total = num((await db.get(`SELECT COUNT(*) n FROM ${from} WHERE ${w}`, ...params)).n);
+    const itens = (await db.all(
       `SELECT v.casa, v.id, v.data, v.orgao, v.titulo, v.descricao, v.ementa, v.aprovada, v.secreta, v.n_sim, v.n_nao, v.n_abst, v.n_obst, v.n_aus, v.n_outro, v.n_total,
-              x.cat voto, x.raw votoRaw, x.partido partidoNaData, x.alinhado, x.ref_tipo refTipo
-       FROM ${from} WHERE ${w} ORDER BY v.data DESC, v.ts DESC LIMIT ? OFFSET ?`, ...params, limit, offset)
+              x.cat voto, x.raw "votoRaw", x.partido "partidoNaData", x.alinhado, x.ref_tipo "refTipo"
+       FROM ${from} WHERE ${w} ORDER BY v.data DESC, v.ts DESC LIMIT ? OFFSET ?`, ...params, limit, offset))
       .map((r) => ({ ...votacaoRow(r), voto: r.voto || null, votoRaw: r.votoRaw || null, partidoNaData: r.partidoNaData || null, alinhado: r.alinhado == null ? null : !!r.alinhado, refTipo: r.refTipo || null }));
     return { total, itens };
   }
 
-  function presencaParlamentar(ctx, casa, id) {
-    const p = requireParlamentar(casa, id);
+  async function presencaParlamentar(ctx, casa, id) {
+    const p = await requireParlamentar(casa, id);
     const de = dateParam(ctx.q.get('de')), ate = dateParam(ctx.q.get('ate'));
-    const j = janela(casa, p.id, de, ate);
+    const j = await janela(casa, p.id, de, ate);
     if (!j || j.ini > j.fim) return { base: casa === 'camara' ? 'sessoes' : 'votacoes', meses: [], sessoes: [], total: 0, presentes: 0, pct: null, janela: j };
     if (casa === 'camara') {
-      const meses = db.all(
-        `SELECT substr(s.data, 1, 7) mes, COUNT(*) total, SUM(p.parlamentar_id IS NOT NULL) presentes
+      const meses = (await db.all(
+        `SELECT substr(s.data, 1, 7) mes, COUNT(*) total, COUNT(p.parlamentar_id) presentes
          FROM sessao s LEFT JOIN presenca p ON p.casa = s.casa AND p.sessao_id = s.id AND p.parlamentar_id = ?
-         WHERE s.casa = ? AND s.complete = 1 AND s.data BETWEEN ? AND ? GROUP BY mes ORDER BY mes`, p.id, casa, j.ini, j.fim)
+         WHERE s.casa = ? AND s.complete = 1 AND s.data BETWEEN ? AND ? GROUP BY mes ORDER BY mes`, p.id, casa, j.ini, j.fim))
         .map((m) => ({ mes: m.mes, total: num(m.total), presentes: num(m.presentes) }));
       const so = ctx.q.get('so') === 'ausencias' ? 'AND p.parlamentar_id IS NULL' : '';
       const limit = clamp(ctx.q.get('limit'), 40, 1, 100), offset = clamp(ctx.q.get('offset'), 0, 0, 1e7);
       const base = `FROM sessao s LEFT JOIN presenca p ON p.casa = s.casa AND p.sessao_id = s.id AND p.parlamentar_id = ?
                     WHERE s.casa = ? AND s.complete = 1 AND s.data BETWEEN ? AND ? ${so}`;
-      const totalSessoes = num(db.get(`SELECT COUNT(*) n ${base}`, p.id, casa, j.ini, j.fim).n);
-      const sessoes = db.all(`SELECT s.id, s.data, s.hora, s.tipo, s.descricao, p.parlamentar_id IS NOT NULL presente ${base} ORDER BY s.data DESC, s.hora DESC LIMIT ? OFFSET ?`, p.id, casa, j.ini, j.fim, limit, offset)
+      const totalSessoes = num((await db.get(`SELECT COUNT(*) n ${base}`, p.id, casa, j.ini, j.fim)).n);
+      const sessoes = (await db.all(`SELECT s.id, s.data, s.hora, s.tipo, s.descricao, p.parlamentar_id IS NOT NULL presente ${base} ORDER BY s.data DESC, s.hora DESC LIMIT ? OFFSET ?`, p.id, casa, j.ini, j.fim, limit, offset))
         .map((s) => ({ ...s, presente: !!s.presente }));
       const total = meses.reduce((a, m) => a + m.total, 0), presentes = meses.reduce((a, m) => a + m.presentes, 0);
       return { base: 'sessoes', meses, sessoes, totalSessoes, total, presentes, pct: pct(presentes, total), janela: j };
     }
-    const meses = db.all(
-      `SELECT substr(v.data, 1, 7) mes, COUNT(*) total, SUM(x.raw IS NOT NULL AND x.raw <> 'NCom') presentes
+    const meses = (await db.all(
+      `SELECT substr(v.data, 1, 7) mes, COUNT(*) total, ${cnt("x.raw IS NOT NULL AND x.raw <> 'NCom'")} presentes
        FROM votacao v LEFT JOIN voto x ON x.casa = v.casa AND x.votacao_id = v.id AND x.parlamentar_id = ?
-       WHERE v.casa = ? AND v.n_total > 0 AND v.data BETWEEN ? AND ? GROUP BY mes ORDER BY mes`, p.id, casa, j.ini, j.fim)
+       WHERE v.casa = ? AND v.n_total > 0 AND v.data BETWEEN ? AND ? GROUP BY mes ORDER BY mes`, p.id, casa, j.ini, j.fim))
       .map((m) => ({ mes: m.mes, total: num(m.total), presentes: num(m.presentes) }));
     const total = meses.reduce((a, m) => a + m.total, 0), presentes = meses.reduce((a, m) => a + m.presentes, 0);
     return { base: 'votacoes', meses, sessoes: [], total, presentes, pct: pct(presentes, total), janela: j };
@@ -297,7 +309,7 @@ export function createApi(db) {
   /* ---------- proposições do parlamentar ---------- */
   const MAIN_TYPES = [...LAW_TYPES, 'MPV'];
   async function proposicoesParlamentar(ctx, casa, id) {
-    const p = requireParlamentar(casa, id);
+    const p = await requireParlamentar(casa, id);
     const q = ctx.q;
     const limit = clamp(q.get('limit'), 30, 1, 100), offset = clamp(q.get('offset'), 0, 0, 1e7);
     if (casa === 'senado') {
@@ -319,8 +331,8 @@ export function createApi(db) {
     }
     const todos = await cached(`autoria:${p.id}`, 6 * HOUR, () => listarAutoriaDeputado(p.id));
     const capazes = todos.filter((x) => LAW_TYPES.includes(x.tipo)).map((x) => x.id);
-    const pendentes = capazes.length ? statusSvc.ensure(capazes) : 0;
-    const st = new Map(db.all('SELECT * FROM proposicao_status WHERE id IN (SELECT value FROM json_each(?))', JSON.stringify(capazes)).map((r) => [r.id, r]));
+    const pendentes = capazes.length ? await statusSvc.ensure(capazes) : 0;
+    const st = new Map((capazes.length ? await db.all('SELECT * FROM proposicao_status WHERE id = ANY(?)', capazes) : []).map((r) => [Number(r.id), r]));
     const porTipo = {};
     for (const x of todos) porTipo[x.tipo] = (porTipo[x.tipo] || 0) + 1;
     const tiposParam = (q.get('tipos') || 'principais');
@@ -343,20 +355,20 @@ export function createApi(db) {
   }
 
   /* ---------- partidos ---------- */
-  function partidos(ctx) {
+  async function partidos(ctx) {
     const q = ctx.q;
     const casa = casaParam(q.get('casa')) || 'camara';
-    const cov = coverage(casa);
+    const cov = await coverage(casa);
     const ate = dateParam(q.get('ate')) || cov.fim || today();
     const de = dateParam(q.get('de')) || addDays(ate, -365);
-    const rows = db.all(
+    const rows = await db.all(
       `SELECT x.partido, COUNT(*) votos, COUNT(DISTINCT x.parlamentar_id) membros, COUNT(DISTINCT x.votacao_id) votacoes,
-              SUM(x.cat = 'sim') sim, SUM(x.cat = 'nao') nao, SUM(x.cat = 'abst') abst, SUM(x.cat = 'obst') obst, SUM(x.cat = 'aus') aus, SUM(x.cat = 'outro') outro,
-              SUM(x.alinhado = 1) alinhados, SUM(x.alinhado IS NOT NULL) com_ref,
-              SUM(x.ref_tipo = 'orientacao' AND x.alinhado = 1) seg_ori, SUM(x.ref_tipo = 'orientacao') com_ori
+              ${cnt("x.cat = 'sim'")} sim, ${cnt("x.cat = 'nao'")} nao, ${cnt("x.cat = 'abst'")} abst, ${cnt("x.cat = 'obst'")} obst, ${cnt("x.cat = 'aus'")} aus, ${cnt("x.cat = 'outro'")} outro,
+              ${cnt('x.alinhado = 1')} alinhados, ${cnt('x.alinhado IS NOT NULL')} com_ref,
+              ${cnt("x.ref_tipo = 'orientacao' AND x.alinhado = 1")} seg_ori, ${cnt("x.ref_tipo = 'orientacao'")} com_ori
        FROM voto x JOIN votacao v ON v.casa = x.casa AND v.id = x.votacao_id
        WHERE x.casa = ? AND v.data BETWEEN ? AND ? GROUP BY x.partido ORDER BY membros DESC, x.partido`, casa, de, ate);
-    const nominais = num(db.get('SELECT COUNT(*) n FROM votacao WHERE casa = ? AND n_total > 0 AND data BETWEEN ? AND ?', casa, de, ate).n);
+    const nominais = num((await db.get('SELECT COUNT(*) n FROM votacao WHERE casa = ? AND n_total > 0 AND data BETWEEN ? AND ?', casa, de, ate)).n);
     return {
       casa, de, ate, nominais,
       itens: rows.map((r) => {
@@ -467,7 +479,7 @@ export function createApi(db) {
       const d = det.value.dados || {};
       const st = d.statusProposicao || {};
       const votacoes = (vot.status === 'fulfilled' ? vot.value : []).sort((a, b) => String(b.dataHoraRegistro).localeCompare(String(a.dataHoraRegistro)));
-      const naBase = new Set(votacoes.length ? db.all("SELECT id FROM votacao WHERE casa = 'camara' AND id IN (SELECT value FROM json_each(?))", JSON.stringify(votacoes.map((v) => v.id))).map((r) => r.id) : []);
+      const naBase = new Set(votacoes.length ? (await db.all("SELECT id FROM votacao WHERE casa = 'camara' AND id = ANY(?)", votacoes.map((v) => String(v.id)))).map((r) => r.id) : []);
       const lei = /transformad[oa] em norma jur/i.test(st.descricaoSituacao || '') || String(st.codSituacao) === '1140';
       return {
         proposicao: {

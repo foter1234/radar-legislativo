@@ -102,7 +102,8 @@ export interface StatusResp {
   camara: { votacoes: number; nominais: number; primeira: string | null; ultima: string | null; parlamentares: number; sessoes: number };
   senado: { votacoes: number; nominais: number; primeira: string | null; ultima: string | null; parlamentares: number; sessoes: number };
   ultimaSync: string | null; desde: string | null;
-  sync: { running: boolean; fase: string; detalhe: string; feito: number; total: number; erros: number; inicio: string | null; fim: string | null; ultimoErro: string };
+  banco?: { tipo: string; tamanhoMB: number | null; limiteMB: number | null };
+  sync: { onde?: string; running: boolean; fase: string; detalhe: string; feito: number; total: number; erros: number; inicio: string | null; fim: string | null; ultimoErro: string };
 }
 
 export class ApiError extends Error {
@@ -120,21 +121,64 @@ export function qs(params: Record<string, string | number | boolean | null | und
   return s ? `?${s}` : '';
 }
 
-export async function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+/* ---------- servidor "dormindo" ----------
+ * Na hospedagem gratuita (Render) o servidor dorme após 15 min sem acesso e leva ~1 min para acordar.
+ * Enquanto isso, as consultas falham ou recebem uma página de espera em vez de JSON. Aqui elas são
+ * repetidas por até ~2 min e a interface mostra um aviso "acordando o servidor". */
+type WakeListener = (waking: boolean) => void;
+const wakeListeners = new Set<WakeListener>();
+let waking = false;
+function setWaking(v: boolean) {
+  if (v === waking) return;
+  waking = v;
+  wakeListeners.forEach((f) => f(v));
+}
+export function onWaking(f: WakeListener): () => void { wakeListeners.add(f); f(waking); return () => { wakeListeners.delete(f); }; }
+export const wakeConfig = { maxMs: 120000, stepMs: 3000 };
+
+const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+  const t = setTimeout(resolve, ms);
+  signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+});
+class Transient extends Error {}
+
+async function attempt<T>(path: string, signal?: AbortSignal): Promise<T> {
   let res: Response;
   try {
     res = await fetch(path, { signal, headers: { Accept: 'application/json' } });
   } catch (e) {
     if ((e as Error).name === 'AbortError') throw e;
-    throw new ApiError(0, 'Sem conexão com o servidor. Verifique sua internet e tente de novo.');
+    throw new Transient('rede');
   }
+  const type = res.headers.get('content-type') || '';
+  if ([502, 503, 504].includes(res.status) || (res.ok && !type.includes('json'))) throw new Transient(`http ${res.status}`);
   if (!res.ok) {
     let msg = 'Não foi possível carregar os dados.';
     try { const j = await res.json(); if (j && j.erro) msg = j.erro; } catch { /* corpo não é JSON */ }
     if (res.status === 429) msg = 'Muitas consultas em pouco tempo. Aguarde alguns segundos.';
     throw new ApiError(res.status, msg);
   }
-  try { return (await res.json()) as T; } catch { throw new ApiError(res.status, 'Resposta inesperada do servidor.'); }
+  try { return (await res.json()) as T; } catch { throw new Transient('json'); }
+}
+
+export async function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      const r = await attempt<T>(path, signal);
+      setWaking(false);
+      return r;
+    } catch (e) {
+      if (!(e instanceof Transient)) throw e;
+      const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      if (offline || Date.now() - start >= wakeConfig.maxMs) {
+        setWaking(false);
+        throw new ApiError(0, offline ? 'Você está sem internet. Conecte-se e tente de novo.' : 'Sem conexão com o servidor. Verifique sua internet e tente de novo.');
+      }
+      setWaking(true);
+      await sleep(wakeConfig.stepMs, signal);
+    }
+  }
 }
 
 export const enc = encodeURIComponent;

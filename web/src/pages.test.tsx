@@ -2,6 +2,9 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import Votacao from './pages/Votacao';
+import { wakeConfig } from './api';
+
+wakeConfig.maxMs = 0;
 
 const votacao = {
   votacao: { casa: 'camara', id: '1-1', data: '2026-05-10', orgao: 'PLEN', titulo: 'PL 1/2026', descricao: 'Votação nominal', ementa: 'Ementa de teste', aprovada: true, secreta: false,
@@ -26,8 +29,19 @@ function mount() {
 }
 
 describe('tela de votação', () => {
+  it('servidor dormindo: repete até acordar (página de espera em HTML, depois JSON)', async () => {
+    wakeConfig.maxMs = 5000; wakeConfig.stepMs = 10;
+    let n = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => (++n < 3
+      ? new Response('<html>acordando</html>', { status: 200, headers: { 'Content-Type': 'text/html' } })
+      : new Response(JSON.stringify(votacao), { status: 200, headers: { 'Content-Type': 'application/json' } }))));
+    mount();
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'PL 1/2026' })).toBeTruthy());
+    expect(n).toBe(3);
+    wakeConfig.maxMs = 0;
+  });
   it('mostra o placar e quem votou em quê', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(votacao), { status: 200 })));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(votacao), { status: 200, headers: { 'Content-Type': 'application/json' } })));
     mount();
     await waitFor(() => expect(screen.getByRole('heading', { name: 'PL 1/2026' })).toBeTruthy());
     expect(screen.getByText('Ana Souza')).toBeTruthy();
@@ -35,7 +49,7 @@ describe('tela de votação', () => {
     expect(screen.getByText(/Votou contra a orientação do partido/)).toBeTruthy();
   });
   it('mostra erro com botão para tentar de novo quando a API falha', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ erro: 'Votação não encontrada' }), { status: 404 })));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ erro: 'Votação não encontrada' }), { status: 404, headers: { 'Content-Type': 'application/json' } })));
     mount();
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Votação não encontrada'));
   });
